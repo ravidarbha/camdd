@@ -1413,6 +1413,7 @@ camdd_probe_pass(struct cam_device *cam_dev, struct camdd_io_opts *io_opts,
 	struct ccb_getdev cgd;
 	int scsi_dev_type, retval;
 	ada_flags ada_flags = 0;
+	struct ata_params *parm;
 	uint8_t command;
 
         if ((retval = get_cgd(cam_dev, &cgd)) != 0) {
@@ -1579,7 +1580,15 @@ camdd_probe_pass(struct cam_device *cam_dev, struct camdd_io_opts *io_opts,
                     goto bailout_error;
                 }
 
-                block_len = (unsigned long)ata_physical_sector_size((struct ata_params *)ptr);
+		parm = (struct ata_params *)(ptr);
+		block_len = (unsigned long)ata_physical_sector_size(parm);
+                if (ada_flags & ADA_FLAG_CAN_48BIT)
+			maxsector = ((u_int64_t)parm->lba_size48_1) |
+			((u_int64_t)parm->lba_size48_2 << 16) |
+			((u_int64_t)parm->lba_size48_3 << 32) |
+			((u_int64_t)parm->lba_size48_4 << 48);
+		else
+			maxsector = (u_int32_t)parm->lba_size_1 | ((u_int32_t)parm->lba_size_2 << 16);
                 printf("block len:%d\n",block_len);
                 break;
 
