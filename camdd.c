@@ -500,12 +500,20 @@ uint32_t camdd_buf_get_len(struct camdd_buf *buf);
 void camdd_buf_add_child(struct camdd_buf *buf, struct camdd_buf *child_buf);
 int camdd_probe_tape(int fd, char *filename, uint64_t *max_iosize,
 		     uint64_t *max_blk, uint64_t *min_blk, uint64_t *blk_gran);
+uint64_t max_sector(int is48bit, struct ata_params *parm);
+int camdd_probe_pass_scsi(struct cam_device *cam_dev, union ccb *ccb,
+		int probe_retry_count, camdd_argmask arglist,
+		int probe_timeout, uint64_t *maxsector, uint32_t *block_len);
+int camdd_probe_pass_ata(struct cam_device *cam_dev, union ccb *ccb,
+		 camdd_argmask arglist, int probe_retry_count,
+		 int probe_timeout, uint8_t command, ada_flags ada_flags,
+		uint64_t *maxsector, uint32_t *block_len);
 void set_flags(ada_flags *flags, struct ccb_getdev *cgd);
 int ata_do_cmd(union ccb *ccb, int retries,
                u_int32_t flags, u_int8_t tag_action,
                u_int8_t command, u_int8_t features, u_int32_t lba,
                u_int16_t sector_count, u_int8_t *data_ptr, size_t dxfer_len,
-               int timeout, ada_flags *ada_flags);
+               int timeout, ada_flags ada_flags);
 struct camdd_dev *camdd_probe_file(int fd, struct camdd_io_opts *io_opts,
 				   int retry_count, int timeout);
 struct camdd_dev *camdd_probe_pass(struct cam_device *cam_dev,
@@ -1354,7 +1362,7 @@ ata_do_cmd(union ccb *ccb, int retries,
         u_int32_t flags, u_int8_t tag_action,
         u_int8_t command, u_int8_t features, u_int32_t lba,
         u_int16_t sector_count, u_int8_t *data_ptr, size_t dxfer_len,
-        int timeout, ada_flags *ada_flags)
+        int timeout, ada_flags ada_flags)
 {
 
         cam_fill_ataio(&ccb->ataio,
@@ -1366,12 +1374,12 @@ ata_do_cmd(union ccb *ccb, int retries,
                 /*dxfer_len*/ dxfer_len,
                 /*timeout*/ timeout);
 
-        if (*ada_flags & ADA_FLAG_CAN_48BIT && lba + sector_count  >= ATA_MAX_28BIT_LBA) {
+        if (ada_flags & ADA_FLAG_CAN_48BIT && lba + sector_count  >= ATA_MAX_28BIT_LBA) {
             ata_48bit_cmd(&ccb->ataio, command, features, lba,
                     sector_count);
 
         }
-        else if (*ada_flags & ATA_SUPPORT_NCQ) {
+        else if (ada_flags & ATA_SUPPORT_NCQ) {
             ata_ncq_cmd(&ccb->ataio, command, lba,
                     sector_count);
         }
@@ -1381,19 +1389,162 @@ ata_do_cmd(union ccb *ccb, int retries,
         }
 	return 0;
 }
-uint64_t
-max_sector(struct ada_flags *ada_flags, struct ata_params *parm)
-{
 
-	if (*ada_flags & ADA_FLAG_CAN_48BIT)
-			return ((u_int64_t)parm->lba_size48_1() |
-					((u_int64_t)parm->lba_size48_2 << 16) |
-					((u_int64_t)parm->lba_size48_3 << 32) |
-					((u_int64_t)parm->lba_size48_4 << 48));
-		else
-			return ((u_int32_t)parm->lba_size_1 | 
-					((u_int32_t)parm->lba_size_2 << 16));
+uint64_t
+max_sector(int is48bit, struct ata_params *parm)
+{
+	if (is48bit)
+		return ((u_int64_t)parm->lba_size48_1 |
+			((u_int64_t)parm->lba_size48_2 << 16) |
+			((u_int64_t)parm->lba_size48_3 << 32) |
+			((u_int64_t)parm->lba_size48_4 << 48));
+	else
+		return ((u_int32_t)parm->lba_size_1 |
+			((u_int32_t)parm->lba_size_2 << 16));
 }
+
+int
+camdd_probe_pass_scsi(struct cam_device *cam_dev, union ccb *ccb, int probe_retry_count,
+			camdd_argmask arglist, int probe_timeout,
+			uint64_t *maxsector, uint32_t *block_len)
+{
+	struct scsi_read_capacity_data rcap;
+	struct scsi_read_capacity_data_long rcaplong;
+
+	bzero(&(&ccb->ccb_h)[1],
+		  sizeof(struct ccb_scsiio) - sizeof(struct ccb_hdr));
+
+	scsi_read_capacity(&ccb->csio,
+			   /*retries*/ probe_retry_count,
+			   /*cbfcnp*/ NULL,
+			   /*tag_action*/ MSG_SIMPLE_Q_TAG,
+			   &rcap,
+			   SSD_FULL_SIZE,
+			   /*timeout*/ probe_timeout ? probe_timeout : 5000);
+
+	/* Disable freezing the device queue */
+	ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
+
+	if (arglist & CAMDD_ARG_ERR_RECOVER)
+		ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
+
+	if (cam_send_ccb(cam_dev, ccb) < 0) {
+		warn("error sending READ CAPACITY command");
+
+		cam_error_print(cam_dev, ccb, CAM_ESF_ALL,
+				CAM_EPF_ALL, stderr);
+		goto bailout;
+	}
+
+	if ((ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+		cam_error_print(cam_dev, ccb, CAM_ESF_ALL, CAM_EPF_ALL, stderr);
+		goto bailout;
+	}
+
+	*maxsector = scsi_4btoul(rcap.addr);
+	*block_len = scsi_4btoul(rcap.length);
+
+	/*
+	 * A last block of 2^32-1 means that the true capacity is over 2TB,
+	 * and we need to issue the long READ CAPACITY to get the real
+	 * capacity.  Otherwise, we're all set.
+	 */
+	if (*maxsector != 0xffffffff)
+		return 0;
+
+	scsi_read_capacity_16(&ccb->csio,
+				  /*retries*/ probe_retry_count,
+				  /*cbfcnp*/ NULL,
+				  /*tag_action*/ MSG_SIMPLE_Q_TAG,
+				  /*lba*/ 0,
+				  /*reladdr*/ 0,
+				  /*pmi*/ 0,
+				  (uint8_t *)&rcaplong,
+				  sizeof(rcaplong),
+				  /*sense_len*/ SSD_FULL_SIZE,
+				  /*timeout*/ probe_timeout ? probe_timeout : 5000);
+
+	/* Disable freezing the device queue */
+	ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
+
+	if (arglist & CAMDD_ARG_ERR_RECOVER)
+		ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
+
+	if (cam_send_ccb(cam_dev, ccb) < 0) {
+		warn("error sending READ CAPACITY (16) command");
+		cam_error_print(cam_dev, ccb, CAM_ESF_ALL,
+				CAM_EPF_ALL, stderr);
+		goto bailout;
+	}
+
+	if ((ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+		cam_error_print(cam_dev, ccb, CAM_ESF_ALL, CAM_EPF_ALL, stderr);
+		goto bailout;
+	}
+
+	*maxsector = scsi_8btou64(rcaplong.addr);
+	*block_len = scsi_4btoul(rcaplong.length);
+	return 0;
+bailout:
+	return -1;
+}
+
+int
+camdd_probe_pass_ata(struct cam_device *cam_dev, union ccb *ccb,
+		 camdd_argmask arglist, int probe_retry_count,
+		 int probe_timeout, uint8_t command, ada_flags ada_flags,
+		uint64_t *maxsector, uint32_t *block_len)
+{
+	int16_t *ptr = NULL;
+	size_t dxfer_len = 0;
+	int retval;
+	struct ata_params *parm;
+
+	dxfer_len = sizeof(struct ata_params);
+	ptr = (uint16_t *)malloc(dxfer_len);
+	if (ptr == NULL) {
+		warnx("can't malloc memory for identify");
+		retval = -1;
+		goto bailout;
+	}
+	bzero(ptr, dxfer_len);
+
+	/* Use the ATA CMDS directly instead of ATA_SCSI Passthrough.*/
+	bzero(&(&ccb->ccb_h)[1], sizeof(struct ccb_ataio) -
+			sizeof(struct ccb_hdr));
+	ata_do_cmd(ccb,
+		/*retries*/probe_retry_count,
+		/*flags*/CAM_DIR_IN,
+		/*tag_action*/MSG_SIMPLE_Q_TAG,
+		/*command*/command,
+		/*features*/0,
+		/*lba*/0,
+		/*sector_count*/sizeof(struct ata_params),
+		/*data_ptr*/(u_int8_t *)ptr,
+		/*dxfer_len*/dxfer_len,
+		/*timeout*/probe_timeout ? probe_timeout : 5000,
+		/*ada_flags*/ada_flags);
+
+	if (arglist & CAMDD_ARG_ERR_RECOVER)
+		ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
+
+	ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
+	retval = cam_send_ccb(cam_dev, ccb);
+
+	if (retval != 0) {
+		warn("error sending ATA_IDENTIFY CCB");
+		retval = -1;
+		goto bailout;
+	}
+
+	parm = (struct ata_params *)(ptr);
+	*block_len = (unsigned long)ata_physical_sector_size(parm);
+	*maxsector = max_sector(ada_flags & ADA_FLAG_CAN_48BIT, parm);
+	retval = 0;
+bailout:
+	return retval;
+}
+
 
 /*
  * Need to implement this.  Do a basic probe:
@@ -1408,32 +1559,32 @@ camdd_probe_pass(struct cam_device *cam_dev, struct camdd_io_opts *io_opts,
 		 int probe_timeout, int io_retry_count, int io_timeout)
 {
 	union ccb *ccb;
-	uint64_t maxsector;
+	uint64_t maxsector = 0;
 	uint32_t cpi_maxio, max_iosize, pass_numblocks;
-	uint32_t block_len;
-	struct scsi_read_capacity_data rcap;
-	struct scsi_read_capacity_data_long rcaplong;
+	uint32_t block_len = 0;
 	struct camdd_dev *dev = NULL;
 	struct camdd_dev_pass *pass_dev;
 	struct kevent ke;
-	int16_t *ptr = NULL;
-	size_t dxfer_len = 0;
 	struct ccb_getdev cgd;
-	int scsi_dev_type, retval;
+	int retval;
 	ada_flags ada_flags = 0;
-	struct ata_params *parm;
 	uint8_t command;
+	int scsi_dev_type;
 
 	if ((retval = get_cgd(cam_dev, &cgd)) != 0) {
 		warnx("couldn't get CGD");
-	return (NULL);
+		return (NULL);
+	}
+
+	if ((ccb = cam_getccb(cam_dev)) == NULL) {
+		warnx("Could not allocate CCB");
+		retval = -1;
+		goto bailout_error;
 	}
 
 	switch(cgd.protocol) {
 		 case PROTO_SCSI:
 			scsi_dev_type = SID_TYPE(&cam_dev->inq_data);
-			maxsector = 0;
-			block_len = 0;
 
 			/*
 			 * For devices that support READ CAPACITY, we'll attempt to get the
@@ -1441,100 +1592,24 @@ camdd_probe_pass(struct cam_device *cam_dev, struct camdd_io_opts *io_opts,
 			 * devices via SCSI passthrough, so just return an error in that case.
 			 */
 			switch (scsi_dev_type) {
-			case T_DIRECT:
-			case T_WORM:
-			case T_CDROM:
-			case T_OPTICAL:
-			case T_RBC:
-				break;
+				case T_DIRECT:
+				case T_WORM:
+				case T_CDROM:
+				case T_OPTICAL:
+				case T_RBC:
+					break;
 
-			default:
-				errx(1, "Unsupported SCSI device type %d", scsi_dev_type);
-				break; /*NOTREACHED*/
-			}
-			ccb = cam_getccb(cam_dev);
+				default:
+					errx(1, "Unsupported SCSI device type %d", scsi_dev_type);
+					break; /*NOTREACHED*/
+			} /*SWitch scsi_dev_type*/
 
-			if (ccb == NULL) {
-				warnx("%s: error allocating ccb", __func__);
-				goto bailout_error;
-			}
 
-			bzero(&(&ccb->ccb_h)[1],
-				  sizeof(struct ccb_scsiio) - sizeof(struct ccb_hdr));
-
-			scsi_read_capacity(&ccb->csio,
-					   /*retries*/ probe_retry_count,
-					   /*cbfcnp*/ NULL,
-					   /*tag_action*/ MSG_SIMPLE_Q_TAG,
-					   &rcap,
-					   SSD_FULL_SIZE,
-					   /*timeout*/ probe_timeout ? probe_timeout : 5000);
-
-			/* Disable freezing the device queue */
-			ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
-
-			if (arglist & CAMDD_ARG_ERR_RECOVER)
-				ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
-
-			if (cam_send_ccb(cam_dev, ccb) < 0) {
-				warn("error sending READ CAPACITY command");
-
-				cam_error_print(cam_dev, ccb, CAM_ESF_ALL,
-						CAM_EPF_ALL, stderr);
-
+			if ((retval = camdd_probe_pass_scsi(cam_dev, ccb, probe_retry_count,
+				arglist, probe_timeout, &maxsector, &block_len))) {
 				goto bailout;
 			}
-
-			if ((ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
-				cam_error_print(cam_dev, ccb, CAM_ESF_ALL, CAM_EPF_ALL, stderr);
-				goto bailout;
-			}
-
-			maxsector = scsi_4btoul(rcap.addr);
-			block_len = scsi_4btoul(rcap.length);
-
-			/*
-			 * A last block of 2^32-1 means that the true capacity is over 2TB,
-			 * and we need to issue the long READ CAPACITY to get the real
-			 * capacity.  Otherwise, we're all set.
-			 */
-			if (maxsector != 0xffffffff)
-				goto rcap_done;
-
-			scsi_read_capacity_16(&ccb->csio,
-						  /*retries*/ probe_retry_count,
-						  /*cbfcnp*/ NULL,
-						  /*tag_action*/ MSG_SIMPLE_Q_TAG,
-						  /*lba*/ 0,
-						  /*reladdr*/ 0,
-						  /*pmi*/ 0,
-						  (uint8_t *)&rcaplong,
-						  sizeof(rcaplong),
-						  /*sense_len*/ SSD_FULL_SIZE,
-						  /*timeout*/ probe_timeout ? probe_timeout : 5000);
-
-			/* Disable freezing the device queue */
-			ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
-
-			if (arglist & CAMDD_ARG_ERR_RECOVER)
-				ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
-
-			if (cam_send_ccb(cam_dev, ccb) < 0) {
-				warn("error sending READ CAPACITY (16) command");
-				cam_error_print(cam_dev, ccb, CAM_ESF_ALL,
-						CAM_EPF_ALL, stderr);
-				goto bailout;
-			}
-
-			if ((ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
-				cam_error_print(cam_dev, ccb, CAM_ESF_ALL, CAM_EPF_ALL, stderr);
-				goto bailout;
-			}
-
-			maxsector = scsi_8btou64(rcaplong.addr);
-			block_len = scsi_4btoul(rcaplong.length);
-			break; /*Switch SCSI*/
-
+			break;
 		 case PROTO_ATA:
 		 case PROTO_ATAPI:
 
@@ -1543,66 +1618,23 @@ camdd_probe_pass(struct cam_device *cam_dev, struct camdd_io_opts *io_opts,
 
 			set_flags(&ada_flags, &cgd);
 
-			if ((ccb = cam_getccb(cam_dev)) == NULL) {
-				warnx("Could not allocate CCB");
-				retval = -1;
-				goto bailout_error;
+			if ((retval = camdd_probe_pass_ata(cam_dev, ccb, arglist, probe_retry_count,
+				 probe_timeout, command, ada_flags, &maxsector, &block_len))) {
+				goto bailout;
 			}
-
-			dxfer_len = sizeof(struct ata_params);
-			ptr = (uint16_t *)malloc(dxfer_len);
-			if (ptr == NULL) {
-				warnx("can't malloc memory for identify");
-				retval = -1;
-				goto bailout_error;
-			}
-			bzero(ptr, dxfer_len);
-
-			/* Use the ATA CMDS directly instead of ATA_SCSI Passthrough.*/
-			bzero(&(&ccb->ccb_h)[1], sizeof(struct ccb_ataio) -
-					sizeof(struct ccb_hdr));
-			ata_do_cmd(ccb,
-					/*retries*/probe_retry_count,
-					/*flags*/CAM_DIR_IN,
-					/*tag_action*/MSG_SIMPLE_Q_TAG,
-					/*command*/command,
-					/*features*/0,
-					/*lba*/0,
-					/*sector_count*/sizeof(struct ata_params),
-					/*data_ptr*/(u_int8_t *)ptr,
-					/*dxfer_len*/dxfer_len,
-					/*timeout*/probe_timeout ? probe_timeout : 5000,
-					/*ada_flags*/&ada_flags);
-
-			ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
-			retval = cam_send_ccb(cam_dev, ccb);
-
-			if (retval != 0) {
-				warn("error sending ATA_IDENTIFY CCB");
-				retval = -1;
-				goto bailout_error;
-			}
-
-			parm = (struct ata_params *)(ptr);
-			block_len = (unsigned long)ata_physical_sector_size(parm);
-			max_sector = max_sector(parm);
 			break; /* switch ATA */
-
 		default:
 			errx(1, "Unsupported PROTO type %d", cgd.protocol);
 			break; /*NOTREACHED*/
 	} /*switch cgd.protocol */
 
-rcap_done:
-
-
         if (block_len == 0) {
             warnx("Sector size for %s%u is 0, cannot continue",
             cam_dev->device_name, cam_dev->dev_unit_num);
-            goto bailout_error;
+            goto bailout;
         }
  
-bzero(&(&ccb->ccb_h)[1],
+	bzero(&(&ccb->ccb_h)[1],
 	      sizeof(struct ccb_scsiio) - sizeof(struct ccb_hdr));
 
 	ccb->ccb_h.func_code = XPT_PATH_INQ;
@@ -2768,18 +2800,18 @@ camdd_pass_run(struct camdd_dev *dev)
 		}
 
 		ata_do_cmd(ccb,
-				/*retries*/dev->retry_count,
-                /*flags*/(is_write == 0) ? CAM_DIR_IN : CAM_DIR_OUT,
-                /*tag_action*/CAM_TAG_ACTION_NONE,
-                /*command*/command,
-                /*features*/0,
-                /*lba*/buf->lba,
-                /*sector_count*/num_blocks,
-                /*data_ptr*/(data->sg_count != 0) ?
-                (uint8_t *)data->segs : data->buf,
-                /*dxfer_len*/num_blocks * pass_dev->block_len,
-                /*timeout*/dev->io_timeout,
-                /*adaflags*/&pass_dev->ada_flags);
+		/*retries*/dev->retry_count,
+		/*flags*/(is_write == 0) ? CAM_DIR_IN : CAM_DIR_OUT,
+		/*tag_action*/CAM_TAG_ACTION_NONE,
+		/*command*/command,
+		/*features*/0,
+		/*lba*/buf->lba,
+		/*sector_count*/num_blocks,
+		/*data_ptr*/(data->sg_count != 0) ?
+		(uint8_t *)data->segs : data->buf,
+		/*dxfer_len*/num_blocks * pass_dev->block_len,
+		/*timeout*/dev->io_timeout,
+		/*adaflags*/pass_dev->ada_flags);
     }
 
     /* Disable freezing the device queue */
