@@ -858,7 +858,6 @@ camdd_buf_sg_create(struct camdd_buf *buf, int iovec, uint32_t sector_size,
 	data = &buf->buf_type_spec.data;
 
 	data->sg_count = buf->src_count;
-	printf("data->sg_cpunt :%d",data->sg_count);
 	/*
 	 * Compose a scatter/gather list from all of the buffers in the list.
 	 * If the length of the buffer isn't a multiple of the sector size,
@@ -903,7 +902,6 @@ camdd_buf_sg_create(struct camdd_buf *buf, int iovec, uint32_t sector_size,
 
 		if (tmp_buf->buf_type == CAMDD_BUF_DATA) {
 			struct camdd_buf_data *tmp_data;
-
 			tmp_data = &tmp_buf->buf_type_spec.data;
 			if (iovec == 0) {
 				data->segs[i].ds_addr =
@@ -2700,16 +2698,12 @@ camdd_pass_run(struct camdd_dev *dev)
 	else
 		num_blocks = data->fill_len / pass_dev->block_len;
 
-        // Never zero.
-        //
-    //assert(data->fill_len != 0);
-    //assert(num_blocks !=0);
-    if(data->fill_len == 0 ) {
-      printf(" still hitting error ..\n");
-      retval = -1;
-      goto bailout;
-    }
-    if (pass_dev->protocol == PROTO_SCSI) {
+	if(data->fill_len == 0 ) {
+		retval = -1;
+		goto bailout;
+	}
+    
+	if (pass_dev->protocol == PROTO_SCSI) {
 
 	bzero(&(&ccb->ccb_h)[1],
 	      sizeof(struct ccb_scsiio) - sizeof(struct ccb_hdr));
@@ -2729,6 +2723,7 @@ camdd_pass_run(struct camdd_dev *dev)
 
 	if (data->sg_count != 0) {
 		ccb->ccb_h.flags |= CAM_DATA_SG;
+		ccb->csio.sglist_cnt = data->sg_count;	
 	}
     }
     else {
@@ -2778,7 +2773,7 @@ camdd_pass_run(struct camdd_dev *dev)
         printf("command %d\n",command);
         ata_do_cmd(ccb,
                     /*retries*/dev->retry_count,
-                    /*flags*/(is_write == 0)?CAM_DIR_IN : CAM_DIR_OUT,
+                    /*flags*/(is_write == 0) ? CAM_DIR_IN : CAM_DIR_OUT,
                     /*tag_action*/CAM_TAG_ACTION_NONE,
                     /*command*/command,
                     /*features*/0,
@@ -2790,9 +2785,6 @@ camdd_pass_run(struct camdd_dev *dev)
                     /*timeout*/dev->io_timeout,
                     /*adaflags*/&pass_dev->ada_flags);
 
-	if (data->sg_count != 0) {
-		ccb->ccb_h.flags |= CAM_DATA_SG;
-	}
     }
 
     /* Disable freezing the device queue */
