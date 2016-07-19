@@ -2736,11 +2736,11 @@ camdd_pass_run(struct camdd_dev *dev)
 	if (pass_dev->protocol == PROTO_SCSI) {
 		bzero(&(&ccb->ccb_h)[1],
 				sizeof(struct ccb_scsiio) - sizeof(struct ccb_hdr));
-	    scsi_read_write(&ccb->csio,
+		scsi_read_write(&ccb->csio,
 			/*retries*/ dev->retry_count,
 			/*cbfcnp*/ NULL,
 			/*tag_action*/ MSG_SIMPLE_Q_TAG,
-            /*readop*/ (is_write == 0) ? SCSI_RW_READ : SCSI_RW_WRITE,
+			/*readop*/ (is_write == 0) ? SCSI_RW_READ : SCSI_RW_WRITE,
 			/*byte2*/ 0,
 			/*minimum_cmd_size*/ dev->min_cmd_size,
 			/*lba*/buf->lba,
@@ -2754,8 +2754,8 @@ camdd_pass_run(struct camdd_dev *dev)
 			ccb->ccb_h.flags |= CAM_DATA_SG;
 			ccb->csio.sglist_cnt = data->sg_count;	
 		}
-    }
-    else {
+	}
+	else {
 
 		bzero(&(&ccb->ccb_h)[1],
 			  sizeof(struct ccb_ataio) - sizeof(struct ccb_hdr));
@@ -2812,43 +2812,43 @@ camdd_pass_run(struct camdd_dev *dev)
 		/*dxfer_len*/num_blocks * pass_dev->block_len,
 		/*timeout*/dev->io_timeout,
 		/*adaflags*/pass_dev->ada_flags);
-    }
+	}
 
-    /* Disable freezing the device queue */
-    ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
+	/* Disable freezing the device queue */
+	ccb->ccb_h.flags |= CAM_DEV_QFRZDIS;
 
-    if (dev->retry_count != 0)
+	if (dev->retry_count != 0)
 		ccb->ccb_h.flags |= CAM_PASS_ERR_RECOVER;
 
-    /*
-     * Store a pointer to the buffer in the CCB.  The kernel will
-     * restore this when we get it back, and we'll use it to identify
-     * the buffer this CCB came from.
-     */
-    ccb->ccb_h.ccb_buf = buf;
+	/*
+	* Store a pointer to the buffer in the CCB.  The kernel will
+	* restore this when we get it back, and we'll use it to identify
+	* the buffer this CCB came from.
+	*/
+	ccb->ccb_h.ccb_buf = buf;
 
-    /*
-     * Unlock our mutex in preparation for issuing the ioctl.
-     */
-    pthread_mutex_unlock(&dev->mutex);
-    /*
-     * Queue the CCB to the pass(4) driver.
-     */
-    if (ioctl(pass_dev->dev->fd, CAMIOQUEUE, ccb) == -1) {
-            pthread_mutex_lock(&dev->mutex);
+	/*
+	* Unlock our mutex in preparation for issuing the ioctl.
+	*/
+	pthread_mutex_unlock(&dev->mutex);
+	/*
+	* Queue the CCB to the pass(4) driver.
+	*/
+	if (ioctl(pass_dev->dev->fd, CAMIOQUEUE, ccb) == -1) {
+		pthread_mutex_lock(&dev->mutex);
 
-            warn("%s: error sending CAMIOQUEUE ioctl to %s%u", __func__,
-                 pass_dev->dev->device_name, pass_dev->dev->dev_unit_num);
-            warn("%s: CCB address is %p", __func__, ccb);
-            retval = -1;
+		warn("%s: error sending CAMIOQUEUE ioctl to %s%u", __func__,
+		pass_dev->dev->device_name, pass_dev->dev->dev_unit_num);
+		warn("%s: CCB address is %p", __func__, ccb);
+		retval = -1;
 
-            STAILQ_INSERT_TAIL(&dev->free_queue, buf, links);
-    } else {
-            pthread_mutex_lock(&dev->mutex);
+		STAILQ_INSERT_TAIL(&dev->free_queue, buf, links);
+	} else {
+		pthread_mutex_lock(&dev->mutex);
 
-            dev->cur_active_io++;
-            STAILQ_INSERT_TAIL(&dev->active_queue, buf, links);
-    }
+		dev->cur_active_io++;
+		STAILQ_INSERT_TAIL(&dev->active_queue, buf, links);
+	}
 
 bailout:
 	return (retval);
@@ -3390,13 +3390,13 @@ camdd_rw(struct camdd_io_opts *io_opts, int num_io_opts, uint64_t max_io,
 				goto bailout;
 			}
 
-            devs[i] = camdd_probe_pass(new_cam_dev,
-			    /*io_opts*/ &io_opts[i],
-			    CAMDD_ARG_ERR_RECOVER, 
-			    /*probe_retry_count*/ 3,
-			    /*probe_timeout*/ 5000,
-			    /*io_retry_count*/ retry_count,
-			    /*io_timeout*/ timeout);
+			devs[i] = camdd_probe_pass(new_cam_dev,
+				/*io_opts*/ &io_opts[i],
+				CAMDD_ARG_ERR_RECOVER,
+				/*probe_retry_count*/ 3,
+				/*probe_timeout*/ 5000,
+				/*io_retry_count*/ retry_count,
+				/*io_timeout*/ timeout);
 			if (devs[i] == NULL) {
 				warn("Unable to probe device %s%u",
 				     new_cam_dev->device_name,
